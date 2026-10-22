@@ -8,6 +8,7 @@ If a PDF already exists locally with the same hash, skips re-download.
 """
 import asyncio
 import hashlib
+import os
 import re
 import sys
 import time
@@ -188,6 +189,9 @@ async def _extract_pdf_url_from_detail_page(
 
 def _upload_to_storage(db, slug: str, pdf_bytes: bytes) -> str | None:
     """Upload PDF to Supabase Storage. Returns public URL or None on failure."""
+    if os.getenv("PASAL_LOCAL_STORAGE"):
+        # Self-hosted stack has no Storage; the PDF stays in data/raw/pdfs.
+        return None
     storage_path = f"{slug}.pdf"
     try:
         db.storage.from_(STORAGE_BUCKET).upload(

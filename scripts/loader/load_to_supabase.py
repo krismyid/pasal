@@ -296,7 +296,10 @@ def render_page_images(sb, pdf_path: Path, slug: str) -> int:
 
     Enables the PdfViewer component to show inline page previews.
     Uploads to regulation-pdfs/{slug}/page-{N}.png (1-indexed).
+    Skipped when PASAL_LOCAL_STORAGE is set (self-hosted stack has no Storage).
     """
+    if os.getenv("PASAL_LOCAL_STORAGE"):
+        return 0
     import pymupdf
 
     bucket = sb.storage.from_("regulation-pdfs")

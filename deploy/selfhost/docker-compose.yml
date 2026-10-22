@@ -1,0 +1,109 @@
+# Self-hosted Pasal.id without Supabase: PostgreSQL + PostgREST.
+#
+# supabase-py talks to {SUPABASE_URL}/rest/v1, so Caddy maps that prefix onto
+# PostgREST. The MCP server and the crawler worker run unchanged against it.
+#
+#   python3 gen_keys.py > .env          # once; never commit .env
+#   docker compose up -d db rest gateway
+#   docker compose run --rm migrate
+#   docker compose up -d mcp worker
+
+name: pasal
+
+services:
+  db:
+    image: postgres:17.6
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run gen_keys.py}
+      POSTGRES_DB: pasal
+      AUTHENTICATOR_PASSWORD: ${AUTHENTICATOR_PASSWORD:?run gen_keys.py}
+    command: >
+      postgres
+      -c shared_buffers=1GB
+      -c effective_cache_size=4GB
+      -c work_mem=32MB
+      -c maintenance_work_mem=512MB
+      -c max_connections=50
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pasal"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  rest:
+    image: postgrest/postgrest:v12.2.12
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${AUTHENTICATOR_PASSWORD}@db:5432/pasal
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET:?run gen_keys.py}
+      PGRST_DB_EXTRA_SEARCH_PATH: public,extensions
+      PGRST_DB_MAX_ROWS: 1000
+      PGRST_DB_POOL: 20
+
+  gateway:
+    image: caddy:2.10.2
+    restart: unless-stopped
+    depends_on: [rest]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    # Internal only by default. Uncomment to reach PostgREST from the host for debugging.
+    # ports:
+    #   - "127.0.0.1:8080:8080"
+
+  migrate:
+    image: postgres:17.6
+    profiles: [tools]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGUSER: postgres
+      PGDATABASE: pasal
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ../../packages/supabase/migrations:/migrations:ro
+      - ./overrides:/overrides:ro
+      - ./migrate.sh:/migrate.sh:ro
+    entrypoint: ["sh", "/migrate.sh"]
+
+  mcp:
+    build: ../../apps/mcp-server
+    restart: unless-stopped
+    depends_on: [gateway]
+    environment:
+      SUPABASE_URL: http://gateway:8080
+      SUPABASE_ANON_KEY: ${ANON_KEY:?run gen_keys.py}
+      PASAL_SITE_URL: ${PASAL_SITE_URL:-https://pasal.id}
+      PORT: 8000
+    ports:
+      - "${MCP_BIND:-0.0.0.0}:8000:8000"
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: scripts/worker/Dockerfile
+    restart: unless-stopped
+    depends_on: [gateway]
+    environment:
+      SUPABASE_URL: http://gateway:8080
+      SUPABASE_KEY: ${SERVICE_ROLE_KEY:?run gen_keys.py}
+      PASAL_LOCAL_STORAGE: "1"
+      WORKER_TYPES: ${WORKER_TYPES:-uu,pp,perpres}
+      WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-10}
+      WORKER_DISCOVERY_FIRST: "true"
+    volumes:
+      - pdfs:/app/data
+
+volumes:
+  pgdata:
+  pdfs:

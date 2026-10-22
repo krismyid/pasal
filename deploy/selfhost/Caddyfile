@@ -1,0 +1,15 @@
+{
+	auto_https off
+	admin off
+}
+
+:8080 {
+	# supabase-py calls {SUPABASE_URL}/rest/v1/<table>; PostgREST serves at /.
+	handle_path /rest/v1/* {
+		reverse_proxy rest:3000
+	}
+	# Storage, auth, realtime are not provided by the self-hosted stack.
+	handle {
+		respond "not available in self-hosted stack" 404
+	}
+}
