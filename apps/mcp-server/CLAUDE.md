@@ -16,6 +16,9 @@ Requires: `SUPABASE_URL` + `SUPABASE_ANON_KEY` in `.env`.
 
 | Tool | Rate limit | Cache TTL | Purpose |
 |------|-----------|-----------|---------|
+| `search_legal(query, regulation_types?, status?, year?, year_from?, year_to?, law_id?, issuing_body?, region?, limit?)` | 30/min | None | v2 search, grouped by law; `law_id` searches inside one law via `document_nodes.fts` |
+| `resolve_law(citation)` | 60/min | None | v2: citation/slug/FRBR/name/law_id → canonical `law_id` (or candidates) |
+| `read_law(law_id, selector?)` | 60/min | Nodes 1h | v2: selectors `outline`, `pasal 27-30`, `bab III`, `menimbang`, `mengingat`, `penjelasan`, `all`; 30k char cap |
 | `search_laws(query, regulation_type?, year_from?, year_to?, language?, limit?)` | 30/min | None | Full-text search via `search_legal_chunks()` RPC |
 | `get_pasal(law_type, law_number, year, pasal_number)` | 60/min | 1h | Exact article text with ayat and cross-references |
 | `get_law_status(law_type, law_number, year)` | 60/min | 1h | Law validity + amendment/revocation chain |
@@ -34,6 +37,8 @@ Requires: `SUPABASE_URL` + `SUPABASE_ANON_KEY` in `.env`.
 
 ```
 server.py          — All tools, caching, rate limiting, cross-reference extraction
+v2.py              — Pure helpers for v2 tools: citation + selector parsing (no DB imports)
+test_v2.py         — Tests for v2 tools and helpers
 test_server.py     — Pytest suite with mocked Supabase client
 Dockerfile         — python:3.12-slim, runs server.py
 requirements.txt   — fastmcp, supabase, python-dotenv

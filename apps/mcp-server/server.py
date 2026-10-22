@@ -1,6 +1,13 @@
-"""Pasal.id MCP Server — Indonesian Legal Database (v0.3).
+"""Pasal.id MCP Server — Indonesian Legal Database (v0.4).
 
-Provides Claude with grounded access to Indonesian legislation through 4 tools:
+Provides Claude with grounded access to Indonesian legislation.
+
+v2 tools (preferred):
+- search_legal: Full-text search with type/status/year filters, or within one law
+- resolve_law: Resolve a citation/name/slug to a canonical law_id
+- read_law: Read a law by law_id with selectors ('pasal 27-30', 'bab III', ...)
+
+Legacy tools:
 - search_laws: Full-text search across Indonesian legal provisions
 - get_pasal: Get exact text of a specific article
 - get_law_status: Check if a law is still in force
@@ -15,6 +22,8 @@ from typing import Any
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from supabase import create_client
+
+import v2
 
 load_dotenv()
 
@@ -53,11 +62,17 @@ mcp = FastMCP(
         "PERMEN/PERMENKUMHAM/PERMENKUM (Ministerial) → "
         "PERBAN (Agency) → PERDA/PERDA_PROV/PERDA_KAB (Regional) → "
         "KEPMEN (Ministerial Decision) → SE (Circular Letter)\n\n"
-        "WORKFLOW — Follow this order for best results:\n"
-        "1. search_laws → Find relevant provisions by topic keyword\n"
-        "2. get_pasal → Get exact article text for citation\n"
-        "3. get_law_status → Verify the law is still in force before citing\n"
-        "4. list_laws → Browse available regulations if search is too narrow\n\n"
+        "WORKFLOW:\n"
+        "- Law named or implied: resolve_law → read_law(law_id, selector).\n"
+        "- Law unknown: search_legal → pick law_id → read_law.\n"
+        "- read_law selectors: 'outline' (start here), 'pasal 27', 'pasal 27-30', "
+        "'pasal 13-16, pasal 40-41', 'bab III', 'menimbang', 'mengingat', "
+        "'penjelasan', 'all'.\n"
+        "- Pass law_id from previous responses as-is; don't re-parse display strings.\n"
+        "- Don't use AND/OR/NOT in queries; write plain Indonesian legal terms.\n"
+        "- If source.verified is false, say the text is not yet verified against the official source.\n"
+        "- get_law_status shows the amendment/revocation chain.\n"
+        "- Legacy tools search_laws, get_pasal, list_laws still work.\n\n"
         "CITATION FORMAT: Always cite as 'Pasal X UU No. Y Tahun Z'\n"
         "Example: 'Pasal 81 UU No. 13 Tahun 2003 tentang Ketenagakerjaan'\n\n"
         "SEARCH TIPS:\n"
@@ -696,6 +711,524 @@ def list_laws(
     except Exception as e:
         logger.error("list_laws failed: %s", e)
         return _with_disclaimer({"error": "Failed to list laws. Please try again later."})
+
+
+# ---------------------------------------------------------------------------
+# v2 tools: search_legal, resolve_law, read_law
+# ---------------------------------------------------------------------------
+
+SITE_URL = os.getenv("PASAL_SITE_URL", "https://pasal.id").rstrip("/")
+READ_LAW_MAX_CHARS = 30_000
+_NODE_PAGE = 1000
+
+_WORK_FIELDS = (
+    "id, frbr_uri, slug, number, year, title_id, status, regulation_type_id, "
+    "source_url, source_pdf_url, content_verified, updated_at, pemrakarsa"
+)
+
+_nodes_cache = TTLCache(ttl_seconds=3600, maxsize=50)
+_rate_limiters.update({
+    "search_legal": RateLimiter(30),
+    "resolve_law": RateLimiter(60),
+    "read_law": RateLimiter(60),
+})
+
+
+def _work_url(work: dict) -> str:
+    code = _reg_types_by_id.get(work["regulation_type_id"], "").lower()
+    slug = work.get("slug") or f"{code}-{work.get('number')}-{work['year']}"
+    return f"{SITE_URL}/peraturan/{code}/{slug}"
+
+
+def _source_block(work: dict) -> dict:
+    return {
+        "law_url": _work_url(work),
+        "official_url": work.get("source_url") or None,
+        "pdf_url": work.get("source_pdf_url") or None,
+        "updated_at": str(work["updated_at"]) if work.get("updated_at") else None,
+        "verified": bool(work.get("content_verified")),
+    }
+
+
+def _law_summary(work: dict) -> dict:
+    code = _reg_types_by_id.get(work["regulation_type_id"], "")
+    return {
+        "law_id": work["id"],
+        "citation": v2.format_citation(code, work.get("number"), work["year"], work.get("title_id")),
+        "title": work["title_id"],
+        "regulation_type": code,
+        "number": work.get("number"),
+        "year": work["year"],
+        "status": work["status"],
+        "frbr_uri": work["frbr_uri"],
+    }
+
+
+def _get_work_by_id(law_id: int) -> dict | None:
+    result = sb.table("works").select(_WORK_FIELDS).eq("id", law_id).execute()
+    return result.data[0] if result.data else None
+
+
+def _get_nodes(work_id: int) -> list[dict]:
+    """All document nodes of a work in reading order (cached, paginated)."""
+    cached = _nodes_cache.get(str(work_id))
+    if cached is not None:
+        return cached
+    nodes: list[dict] = []
+    offset = 0
+    while True:
+        page = sb.table("document_nodes").select(
+            "id, node_type, number, heading, content_text, parent_id, sort_order, pdf_page_start"
+        ).eq("work_id", work_id).order("sort_order").range(offset, offset + _NODE_PAGE - 1).execute()
+        rows = page.data or []
+        nodes.extend(rows)
+        if len(rows) < _NODE_PAGE:
+            break
+        offset += _NODE_PAGE
+    _nodes_cache.set(str(work_id), nodes)
+    return nodes
+
+
+def _node_label(node: dict) -> str:
+    t = node["node_type"]
+    num = node.get("number") or ""
+    if t == "penjelasan_umum":
+        return "Penjelasan Umum"
+    if t == "penjelasan_pasal":
+        return f"Penjelasan Pasal {num}".strip()
+    if t == "preamble":
+        return "Pembukaan"
+    if t == "content":
+        return "Isi"
+    return f"{t.capitalize()} {num}".strip() if t != "bab" else f"BAB {num}"
+
+
+def _render_node(node: dict) -> dict:
+    out = {"node_id": node["id"], "label": _node_label(node)}
+    if node.get("heading"):
+        out["heading"] = node["heading"]
+    if node.get("content_text"):
+        out["text"] = node["content_text"]
+    if node.get("pdf_page_start"):
+        out["pdf_page_hint"] = node["pdf_page_start"]
+    return out
+
+
+def _outline(nodes: list[dict]) -> dict:
+    """Chapter list with the pasal range of each, plus available selectors."""
+    chapters: list[dict] = []
+    current: dict | None = None
+    loose_pasal: list[str] = []
+    has = {t: False for t in ("preamble", "penjelasan_umum", "penjelasan_pasal")}
+    for n in nodes:
+        t = n["node_type"]
+        if t in has:
+            has[t] = True
+        if t == "bab":
+            current = {"selector": f"bab {n.get('number')}", "heading": n.get("heading"), "pasal": []}
+            chapters.append(current)
+        elif t == "pasal":
+            (current["pasal"] if current else loose_pasal).append(n.get("number"))
+    for c in chapters:
+        p = c.pop("pasal")
+        c["pasal_range"] = f"Pasal {p[0]}–{p[-1]}" if p else None
+        c["pasal_count"] = len(p)
+    selectors = ["pasal <n>", "pasal <a>-<b>", "bab <romawi>", "all"]
+    if has["preamble"]:
+        selectors[:0] = ["menimbang", "mengingat"]
+    if has["penjelasan_umum"] or has["penjelasan_pasal"]:
+        selectors += ["penjelasan", "penjelasan pasal <n>"]
+    out: dict = {
+        "pasal_total": sum(1 for n in nodes if n["node_type"] == "pasal"),
+        "chapters": chapters,
+        "selectors": selectors,
+    }
+    if loose_pasal and not chapters:
+        out["pasal_range"] = f"Pasal {loose_pasal[0]}–{loose_pasal[-1]}"
+    return out
+
+
+def _select_nodes(nodes: list[dict], sel: "v2.Selector") -> tuple[list[dict], str | None]:
+    """Return (nodes, note) for one selector part."""
+    if sel.kind == "all":
+        return [n for n in nodes if n["node_type"] != "ayat"], None
+
+    if sel.kind in {"menimbang", "mengingat", "preamble"}:
+        pre = [n for n in nodes if n["node_type"] == "preamble"]
+        if not pre:
+            return [], "Bagian pembukaan tidak tersedia pada hasil parsing."
+        if sel.kind == "preamble":
+            return pre, None
+        text = "\n".join(n.get("content_text") or "" for n in pre)
+        part = v2.slice_preamble(text, sel.kind)
+        if not part:
+            return pre, f"Penanda '{sel.kind.capitalize()}' tidak ditemukan; mengembalikan seluruh pembukaan."
+        return [{**pre[0], "content_text": part, "node_type": "preamble"}], None
+
+    if sel.kind == "bab":
+        out: list[dict] = []
+        inside = False
+        for n in nodes:
+            if n["node_type"] == "bab":
+                if inside:
+                    break
+                inside = v2.chapter_number(n.get("number")) == sel.bab
+            elif n["node_type"] in {"penjelasan_umum", "penjelasan_pasal"}:
+                if inside:
+                    break
+            if inside and n["node_type"] != "ayat":
+                out.append(n)
+        return out, None if out else f"BAB {sel.raw.split()[-1].upper()} tidak ditemukan."
+
+    if sel.kind in {"penjelasan", "penjelasan_umum"}:
+        types = {"penjelasan_umum"} if sel.kind == "penjelasan_umum" else {"penjelasan_umum", "penjelasan_pasal"}
+        out = [n for n in nodes if n["node_type"] in types]
+        return out, None if out else "Penjelasan tidak tersedia pada hasil parsing."
+
+    if sel.kind in {"pasal", "penjelasan_pasal"}:
+        out = [n for n in nodes if n["node_type"] == sel.kind and v2.in_range(n.get("number"), sel)]
+        if sel.ayat and out:
+            ayat = [
+                n for n in nodes
+                if n["node_type"] == "ayat" and n.get("parent_id") == out[0]["id"] and n.get("number") == sel.ayat
+            ]
+            if ayat:
+                return [{**ayat[0], "number": f"{out[0].get('number')} ayat ({sel.ayat})", "node_type": "pasal"}], None
+            return out, f"Ayat ({sel.ayat}) tidak ditemukan sebagai node terpisah; mengembalikan seluruh Pasal."
+        if not out:
+            return [], f"{sel.raw} tidak ditemukan."
+        return out, None
+
+    return [], None
+
+
+@mcp.tool
+def search_legal(
+    query: str,
+    regulation_types: list[str] | None = None,
+    status: list[str] | None = None,
+    year: int | None = None,
+    year_from: int | None = None,
+    year_to: int | None = None,
+    law_id: int | None = None,
+    issuing_body: str | None = None,
+    region: str | None = None,
+    limit: int = 10,
+) -> dict:
+    """WHEN the relevant law is unknown, search Indonesian legal text with filters.
+
+    If a law is already known, prefer resolve_law then read_law.
+    DO NEXT: pass a returned law_id to read_law (e.g. selector 'pasal 81').
+
+    Args:
+        query: Indonesian legal search terms, e.g. 'upah minimum', 'pemutusan hubungan kerja'. No AND/OR/NOT.
+        regulation_types: Type codes, e.g. ['UU', 'PP', 'PERPRES'].
+        status: Any of berlaku, diubah, dicabut, tidak_berlaku.
+        year: Exact enactment year (takes precedence over year_from/year_to).
+        year_from: Inclusive start year.
+        year_to: Inclusive end year.
+        law_id: Search only inside this law. Other filters are ignored.
+        issuing_body: Filter on initiator (pemrakarsa), e.g. 'Kementerian Ketenagakerjaan'.
+        region: Province/city/regency for regional regulations, e.g. 'Kota Bekasi' (matched on title).
+        limit: Maximum results, 1-20.
+    """
+    rate_err = _check_rate_limit("search_legal")
+    if rate_err:
+        return rate_err
+
+    t0 = time.time()
+    if not query or not query.strip():
+        return _with_disclaimer({"error_code": "empty_query", "message": "Query cannot be empty."})
+    limit = max(1, min(20, limit))
+    logger.info("search_legal called: query=%r types=%s status=%s law_id=%s", query, regulation_types, status, law_id)
+
+    try:
+        _ensure_reg_types()
+        if law_id is not None:
+            return _search_within_law(query.strip(), law_id, limit)
+
+        metadata_filter: dict = {}
+        if regulation_types:
+            metadata_filter["type"] = ",".join(t.upper().strip() for t in regulation_types)
+        if status:
+            metadata_filter["status"] = ",".join(s.lower().strip() for s in status)
+        if year:
+            metadata_filter["year"] = year
+        elif year_from:
+            metadata_filter["year_from"] = year_from
+
+        result = sb.rpc("search_legal_chunks", {
+            "query_text": query.strip(),
+            "match_count": limit * 4,
+            "metadata_filter": metadata_filter,
+        }).execute()
+        rows = result.data or []
+
+        works_map: dict[int, dict] = {}
+        if rows:
+            ids = list({r["work_id"] for r in rows})
+            works_map = {w["id"]: w for w in sb.table("works").select(_WORK_FIELDS).in_("id", ids).execute().data}
+
+        best: dict[int, dict] = {}
+        for r in rows:
+            work = works_map.get(r["work_id"])
+            if not work:
+                continue
+            if not year and year_to and work["year"] > year_to:
+                continue
+            if issuing_body and issuing_body.lower() not in (work.get("pemrakarsa") or "").lower():
+                continue
+            if region and region.lower() not in work["title_id"].lower():
+                continue
+            prev = best.get(work["id"])
+            if prev and prev["score"] >= r["score"]:
+                continue
+            meta = r.get("metadata") or {}
+            entry = _law_summary(work)
+            entry.update({
+                "pasal": f"Pasal {meta['pasal']}" if meta.get("pasal") else None,
+                "snippet": r.get("snippet") or (r.get("content") or "")[:300],
+                "score": round(r["score"], 4),
+                "url": _work_url(work),
+            })
+            best[work["id"]] = entry
+
+        results = sorted(best.values(), key=lambda e: e["score"], reverse=True)[:limit]
+        logger.info("search_legal: %d results for %r (%.0fms)", len(results), query, (time.time() - t0) * 1000)
+        if not results:
+            return _with_disclaimer({
+                "results": [],
+                "message": _no_results_message(f"'{query}'"),
+                "suggestion": "Try synonyms, simpler terms, or remove filters.",
+            })
+        return _with_disclaimer({"results": results, "next": "read_law(law_id, selector)"})
+    except Exception as e:
+        logger.error("search_legal failed: %s", e)
+        return _with_disclaimer({
+            "error_code": "search_failed",
+            "message": "Search failed unexpectedly.",
+            "recovery": {"suggestion": "Retry with simpler terms or remove filters."},
+        })
+
+
+def _search_within_law(query: str, law_id: int, limit: int) -> dict:
+    work = _get_work_by_id(law_id)
+    if not work:
+        return _with_disclaimer({"error_code": "law_not_found", "message": f"law_id {law_id} not found."})
+    rows = sb.table("document_nodes").select(
+        "id, node_type, number, content_text"
+    ).eq("work_id", law_id).in_(
+        "node_type", ["pasal", "preamble", "content", "penjelasan_umum", "penjelasan_pasal"]
+    ).order("sort_order").limit(limit).text_search(
+        # text_search returns a terminal builder, so it must come last.
+        "fts", query, options={"config": "indonesian", "type": "web_search"}
+    ).execute().data or []
+    hits = [{
+        "node_id": r["id"],
+        "label": _node_label(r),
+        "selector": f"pasal {r['number']}" if r["node_type"] == "pasal" else None,
+        "snippet": (r.get("content_text") or "")[:300],
+    } for r in rows]
+    return _with_disclaimer({"law": _law_summary(work), "results": hits, "source": _source_block(work)})
+
+
+@mcp.tool
+def resolve_law(citation: str) -> dict:
+    """Resolve a regulation citation or name to a canonical law_id.
+
+    USE WHEN: the user names or implies a regulation, e.g. 'UU 13/2003',
+    'UU No. 13 Tahun 2003', 'PP 35 2021', 'UU Ketenagakerjaan', 'uu-13-2003',
+    '/akn/id/act/uu/2003/13', or a numeric law_id.
+    DO NEXT: read_law(law_id, selector) — start with selector 'outline' if unsure.
+
+    Args:
+        citation: Citation, slug, FRBR URI, short name, or law_id.
+    """
+    rate_err = _check_rate_limit("resolve_law")
+    if rate_err:
+        return rate_err
+    if not citation or not citation.strip():
+        return _with_disclaimer({"error_code": "empty_citation", "message": "Citation cannot be empty."})
+
+    t0 = time.time()
+    text = citation.strip()
+    logger.info("resolve_law called: %r", text)
+    try:
+        _ensure_reg_types()
+
+        if text.isdigit() and len(text) < 8 and not (len(text) == 4 and text.startswith(("19", "20"))):
+            work = _get_work_by_id(int(text))
+            if work:
+                return _resolved(work, "law_id")
+
+        if re.fullmatch(r"[a-z0-9_]+(?:-[a-z0-9_]+)+", text.lower()):
+            res = sb.table("works").select(_WORK_FIELDS).eq("slug", text.lower()).execute()
+            if res.data:
+                return _resolved(res.data[0], "slug")
+
+        if text.lower().lstrip("/").startswith("akn/"):
+            uri = "/" + text.lstrip("/")
+            res = sb.table("works").select(_WORK_FIELDS).eq("frbr_uri", uri).execute()
+            if res.data:
+                return _resolved(res.data[0], "frbr_uri")
+
+        cit = v2.parse_citation(text)
+        code = cit.type_code if cit.type_code in _reg_types else None
+
+        if code and cit.number and cit.year:
+            res = sb.table("works").select(_WORK_FIELDS).match({
+                "regulation_type_id": _reg_types[code], "number": cit.number, "year": cit.year,
+            }).execute()
+            if res.data:
+                return _resolved(res.data[0], "citation")
+
+        # Fallback: rank candidates with the search function (identity + title FTS).
+        metadata_filter = {"type": code} if code else {}
+        if cit.year and not cit.number:
+            metadata_filter["year"] = cit.year
+        rows = sb.rpc("search_legal_chunks", {
+            "query_text": text, "match_count": 20, "metadata_filter": metadata_filter,
+        }).execute().data or []
+        ids: list[int] = []
+        for r in sorted(rows, key=lambda r: r["score"], reverse=True):
+            if r["work_id"] not in ids:
+                ids.append(r["work_id"])
+        candidates: list[dict] = []
+        if ids:
+            wm = {w["id"]: w for w in sb.table("works").select(_WORK_FIELDS).in_("id", ids[:5]).execute().data}
+            candidates = [_law_summary(wm[i]) for i in ids[:5] if i in wm]
+
+        logger.info("resolve_law: %d candidates for %r (%.0fms)", len(candidates), text, (time.time() - t0) * 1000)
+        if len(candidates) == 1:
+            return _resolved(wm[candidates[0]["law_id"]], "search")
+        if not candidates:
+            return _with_disclaimer({
+                "resolved": False,
+                "message": _no_results_message(f"'{text}'"),
+                "suggestion": "Check type/number/year, or use search_legal with topic terms.",
+            })
+        return _with_disclaimer({
+            "resolved": False,
+            "message": "Ambiguous citation; pick a law_id from candidates.",
+            "candidates": candidates,
+        })
+    except Exception as e:
+        logger.error("resolve_law failed: %s", e)
+        return _with_disclaimer({"error_code": "resolve_failed", "message": "Failed to resolve citation."})
+
+
+def _resolved(work: dict, matched_by: str) -> dict:
+    out = {"resolved": True, "matched_by": matched_by, **_law_summary(work)}
+    out["status_explanation"] = STATUS_EXPLANATIONS.get(work["status"], "")
+    out["source"] = _source_block(work)
+    out["next"] = f"read_law(law_id={work['id']}, selector='outline' | 'pasal 1' | 'bab I')"
+    return _with_disclaimer(out)
+
+
+@mcp.tool
+def read_law(law_id: int, selector: str = "outline") -> dict:
+    """Read part of a regulation by law_id using a simple selector.
+
+    USE WHEN: you have a law_id (from resolve_law or search_legal).
+    Selectors: 'outline' (default: chapters + pasal ranges), 'pasal 27',
+    'pasal 27-30', 'pasal 13-16, pasal 40-41', 'pasal 81 ayat 2', 'bab III',
+    'menimbang', 'mengingat', 'penjelasan', 'penjelasan pasal 5', 'all'.
+    Don't read 'all' for long laws — start from 'outline'.
+
+    Args:
+        law_id: Canonical law_id.
+        selector: What to read (see above). Comma-separate multiple parts.
+    """
+    rate_err = _check_rate_limit("read_law")
+    if rate_err:
+        return rate_err
+
+    t0 = time.time()
+    logger.info("read_law called: law_id=%s selector=%r", law_id, selector)
+    try:
+        parts = v2.parse_selector(selector)
+    except ValueError as e:
+        return _with_disclaimer({
+            "error_code": "invalid_selector",
+            "message": str(e),
+            "examples": ["outline", "pasal 27", "pasal 27-30", "bab III", "menimbang", "penjelasan", "all"],
+        })
+
+    try:
+        _ensure_reg_types()
+        work = _get_work_by_id(law_id)
+        if not work:
+            return _with_disclaimer({
+                "error_code": "law_not_found",
+                "message": f"law_id {law_id} not found. Use resolve_law or search_legal first.",
+            })
+        nodes = _get_nodes(law_id)
+        out: dict = {"law": _law_summary(work), "selector": selector}
+
+        if not nodes:
+            out["message"] = "No parsed text for this law yet."
+            out["source"] = _source_block(work)
+            return _with_disclaimer(out)
+
+        notes: list[str] = []
+        sections: list[dict] = []
+        seen: set[tuple] = set()
+        for sel in parts:
+            if sel.kind == "outline":
+                out["outline"] = _outline(nodes)
+                continue
+            if sel.kind in {"lampiran", "source"}:
+                notes.append(
+                    f"'{sel.raw}' is not available from parsed text on this server; "
+                    "open pdf_url in source to read it."
+                )
+                continue
+            picked, note = _select_nodes(nodes, sel)
+            if note:
+                notes.append(note)
+            for n in picked:
+                # Menimbang and mengingat are slices of the same preamble node.
+                key = (n["id"], sel.kind if n["node_type"] == "preamble" else "")
+                if key in seen:
+                    continue
+                seen.add(key)
+                sections.append(_render_node(n))
+
+        total = 0
+        for i, s in enumerate(sections):
+            total += len(s.get("text", "")) + len(s.get("heading", ""))
+            if total > READ_LAW_MAX_CHARS:
+                remaining = sections[i:]
+                sections = sections[:i]
+                notes.append(
+                    f"Truncated at {READ_LAW_MAX_CHARS} chars; {len(remaining)} more node(s) "
+                    f"starting at {remaining[0]['label']}. Use a narrower selector."
+                )
+                break
+
+        if sections:
+            out["content"] = sections
+            refs: list[dict] = []
+            for s in sections:
+                for r in extract_cross_references(s.get("text", "")):
+                    if r not in refs:
+                        refs.append(r)
+            if refs:
+                out["cross_references"] = refs[:50]
+        if notes:
+            out["notes"] = notes
+        if not sections and "outline" not in out:
+            out["outline"] = _outline(nodes)
+        out["status"] = work["status"]
+        out["status_explanation"] = STATUS_EXPLANATIONS.get(work["status"], "")
+        out["source"] = _source_block(work)
+        if not out["source"]["verified"]:
+            out["verification_note"] = "Text is parsed from PDF and not yet verified against the official source."
+        logger.info("read_law: law_id=%s %d sections (%.0fms)", law_id, len(sections), (time.time() - t0) * 1000)
+        return _with_disclaimer(out)
+    except Exception as e:
+        logger.error("read_law failed: %s", e)
+        return _with_disclaimer({"error_code": "read_failed", "message": "Failed to read law."})
 
 
 @mcp.tool
